@@ -1,7 +1,0 @@
-node_modules/
-dist/
-.env
-
-# Students ka private data GitHub par nahi jana chahiye
-server/data/
-server/uploads/

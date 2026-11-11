@@ -9,39 +9,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* =====================================================
-   SETTINGS: yahan apne courses, fees aur timings likho
-   (course ke naam bilkul wahi hon jo form mein hain)
-   ===================================================== */
-const COURSES = {
-  "Office Automation":     { code: "OA",  fees: "Rs. 4999/-" },
-  "Graphic Designing":     { code: "GD",  fees: "Rs. 4999/-" },
-  "Digital Marketing":     { code: "DM",  fees: "Rs. 4999/-" },
-  "Web & App Development": { code: "WEB", fees: "Rs. 4999/-" },
-  "Power BI":              { code: "PBI", fees: "Rs. 4999/-" },
-};
-
-// Card par jo batch likha aye
-const BATCH = "1";
-
-// Student jo time chune, card par wo aise likha aye
-// (real timings likh sakti ho, maslan "Mon to Fri ( 3pm to 5pm )")
-const TIMINGS = {
-  Morning: "Morning",
-  Afternoon: "Afternoon",
-  Evening: "Evening",
-};
-
-/* ---------- Folders ---------- */
+/* ---------- Folders / files ---------- */
 const DATA_DIR = path.join(__dirname, "data");
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const EXCEL_FILE = path.join(DATA_DIR, "registrations.xlsx");
+const COURSES_FILE = path.join(__dirname, "courses.json");
 
 [DATA_DIR, UPLOAD_DIR].forEach((dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
 app.use("/uploads", express.static(UPLOAD_DIR));
+
+/* Courses har request par file se parhe jate hain,
+   is liye courses.json badalne par server restart nahi karna parta */
+function loadCourses() {
+  return JSON.parse(fs.readFileSync(COURSES_FILE, "utf8"));
+}
 
 /* ---------- Photo upload (JPG/PNG, max 2MB) ---------- */
 const storage = multer.diskStorage({
@@ -77,7 +61,7 @@ const COLUMNS = [
   { header: "Address", key: "address", width: 34 },
   { header: "Institute", key: "institute", width: 30 },
   { header: "Course", key: "course", width: 24 },
-  { header: "Preferred Time", key: "time", width: 14 },
+  { header: "Class Time", key: "classTime", width: 28 },
   { header: "Batch", key: "batch", width: 10 },
   { header: "Fees", key: "fees", width: 14 },
   { header: "Photo File", key: "photo", width: 26 },
@@ -121,7 +105,7 @@ function toCard(r) {
     address: r.address,
     course: r.course,
     batch: r.batch,
-    classTime: TIMINGS[r.time] || r.time,
+    classTime: r.classTime,
     rollNo: r.rollNo,
     amount: r.fees,
     photo: `/uploads/${r.photo}`,
@@ -130,7 +114,7 @@ function toCard(r) {
 
 const digits = (s) => String(s || "").replace(/\D/g, "");
 
-/* Ek waqt mein sirf ek hi write ho (Excel file corrupt na ho) */
+/* Ek waqt mein sirf ek hi read/write ho (Excel file corrupt na ho) */
 let queue = Promise.resolve();
 const enqueue = (task) => {
   const run = queue.then(task);
@@ -140,6 +124,44 @@ const enqueue = (task) => {
 
 /* ---------- Routes ---------- */
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+/* Form ke dropdown ke liye: sirf wo courses jo open hain aur jin mein seats bachi hain */
+app.get("/api/courses", async (req, res) => {
+  try {
+    const courses = loadCourses().filter((c) => c.open !== false);
+
+    // Har course+batch mein ab tak kitne students register hue
+    let counts = {};
+    try {
+      counts = await enqueue(async () => {
+        const { ws } = await openSheet();
+        const map = {};
+        ws.eachRow((row, n) => {
+          if (n === 1) return;
+          const r = rowToObj(row);
+          const key = `${r.course}|${r.batch}`;
+          map[key] = (map[key] || 0) + 1;
+        });
+        return map;
+      });
+    } catch (e) {
+      console.error("Could not count registrations:", e.message);
+    }
+
+    const list = courses
+      .map((c) => {
+        const taken = counts[`${c.name}|${c.batch}`] || 0;
+        const seatsLeft = c.seats ? Math.max(c.seats - taken, 0) : null;
+        return { name: c.name, classTime: c.classTime, fees: c.fees, seatsLeft };
+      })
+      .filter((c) => c.seatsLeft === null || c.seatsLeft > 0);
+
+    res.json(list);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not load courses. Please check courses.json." });
+  }
+});
 
 app.post("/api/register", upload.single("photo"), async (req, res) => {
   const removePhoto = () => {
@@ -154,14 +176,23 @@ app.post("/api/register", upload.single("photo"), async (req, res) => {
     const b = req.body;
 
     const required = [
-      "institute", "course", "time", "fullName", "guardian", "email",
+      "institute", "course", "fullName", "guardian", "email",
       "phone", "city", "cnic", "gender", "dob", "qualification", "address",
     ];
     const missing = required.filter((k) => !b[k] || !String(b[k]).trim());
     if (missing.length || !req.file) {
       return fail(400, "Please fill all required fields and upload a photo.");
     }
-    if (!COURSES[b.course]) return fail(400, "Invalid course selected.");
+
+    // Course abhi open hai?
+    let courses;
+    try {
+      courses = loadCourses();
+    } catch {
+      return fail(500, "Courses could not be loaded. Please contact the institute.");
+    }
+    const course = courses.find((c) => c.name === b.course && c.open !== false);
+    if (!course) return fail(400, "This course is not open for registration right now.");
 
     const cnic = digits(b.cnic);
     const phone = digits(b.phone);
@@ -173,18 +204,23 @@ app.post("/api/register", upload.single("photo"), async (req, res) => {
 
       // Pehle se registered? (same CNIC + same course)
       let existing = null;
+      let taken = 0;
       ws.eachRow((row, n) => {
         if (n === 1) return;
         const r = rowToObj(row);
-        if (r.cnic === cnic && r.course === b.course) existing = r;
+        if (r.cnic === cnic && r.course === course.name) existing = r;
+        if (r.course === course.name && r.batch === String(course.batch)) taken++;
       });
       if (existing) {
         // Phone bhi match kare to wohi purana card dobara de do
         return existing.phone === phone ? { record: existing, repeat: true } : { duplicate: true };
       }
 
+      // Seats khatam?
+      if (course.seats && taken >= course.seats) return { full: true };
+
       // Roll number: SAIT-<CODE>-0001
-      const prefix = `SAIT-${COURSES[b.course].code}-`;
+      const prefix = `SAIT-${course.code}-`;
       let max = 0;
       ws.eachRow((row, n) => {
         if (n === 1) return;
@@ -198,8 +234,9 @@ app.post("/api/register", upload.single("photo"), async (req, res) => {
         ...Object.fromEntries(required.map((k) => [k, String(b[k]).trim()])),
         cnic,
         phone,
-        batch: BATCH,
-        fees: COURSES[b.course].fees,
+        classTime: course.classTime,
+        batch: String(course.batch),
+        fees: course.fees,
         photo: req.file.filename,
       };
 
@@ -208,9 +245,8 @@ app.post("/api/register", upload.single("photo"), async (req, res) => {
       return { record };
     });
 
-    if (result.duplicate) {
-      return fail(409, "This CNIC is already registered for this course.");
-    }
+    if (result.duplicate) return fail(409, "This CNIC is already registered for this course.");
+    if (result.full) return fail(409, "Sorry, seats for this course are full.");
     if (result.repeat) removePhoto(); // nayi photo ki zaroorat nahi
 
     res.status(201).json({ success: true, student: toCard(result.record) });

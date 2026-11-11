@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Web & App Development",
+    "code": "WEB",
+    "classTime": "Tue and Fri ( 3pm to 5pm )",
+    "fees": "Rs. 4999/-",
+    "batch": "1",
+    "seats": 30,
+    "open": true
+  },
+  {
+    "name": "Graphic Designing",
+    "code": "GD",
+    "classTime": "Mon and Wed ( 5pm to 7pm )",
+    "fees": "Rs. 4999/-",
+    "batch": "1",
+    "seats": 30,
+    "open": true
+  }
+]
